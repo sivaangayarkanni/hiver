@@ -92,3 +92,6 @@ artifacts/           # generated models + eval outputs (gitignored pkl ok to reg
 ## License note
 
 Take-home submission code; sample text is synthetic. Third-party libs retain their own licenses (see `CITATIONS.md`).
+
+## PR note
+This feature branch is the review surface for the take-home MVP.
