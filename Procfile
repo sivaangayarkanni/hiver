@@ -1,0 +1,1 @@
+web: uvicorn hiver_agent.web.app:app --host 0.0.0.0 --port ${PORT:-8000}

@@ -16,7 +16,7 @@ Honest MVP of a Twitter/X-style **AppleSupport** agent that:
 # 0) clone & enter
 git clone https://github.com/sivaangayarkanni/hiver.git
 cd hiver
-git checkout feat/applesupport-mvp   # or main if merged
+git checkout main
 
 # 1) Python 3.11+ venv
 python3 -m venv .venv
@@ -59,10 +59,47 @@ python -m hiver_agent evaluate --live --judge-sample 10
 
 `--dry-run` / missing `OPENAI_API_KEY` uses fixture replies + mock judge — fully reproducible offline.
 
+
+## Web demo (no API key)
+
+```bash
+pip install -e .
+uvicorn hiver_agent.web.app:app --host 0.0.0.0 --port ${PORT:-8000}
+# open http://localhost:8000
+```
+
+`GET /` is a single-page UI. `POST /api/analyze` accepts `{ "text": "...", "dry_run": true }` and runs classify → draft → escalate. `GET /health` returns ok.
+
+On startup (or first request) the app loads `artifacts/tfidf_logreg.pkl` if present, otherwise trains TF-IDF quickly from `data/sample` or `data/golden`. Default `dry_run=true` so no OpenAI key is required.
+
+## Deploy (Railway / Render)
+
+`main` is deploy-ready.
+
+**Start command**
+
+```bash
+uvicorn hiver_agent.web.app:app --host 0.0.0.0 --port ${PORT:-8000}
+```
+
+**Railway**
+
+1. New project → Deploy from GitHub repo `sivaangayarkanni/hiver` on branch `main`
+2. Uses `Dockerfile` + `railway.toml` (health check: `GET /health`)
+3. Optional env: `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL` (omit all three for the mock LLM)
+
+**Render**
+
+1. New Web Service → this repo
+2. Docker: uses `Dockerfile`
+3. Native Python: build `pip install .` and the start command above (`Procfile` is included)
+
+No API key is required for the public dry-run demo.
+
 ## Layout
 
 ```
-src/hiver_agent/     # package (classify, retrieve, escalate, eval, pipeline, cli)
+src/hiver_agent/     # package (classify, retrieve, escalate, eval, pipeline, cli, web)
 data/sample/         # ~250 AppleSupport-style messages / ~110 threads (JSONL)
 data/golden/         # 200 labelled golden examples
 data/fixtures/       # tiny fixtures for tests
@@ -94,4 +131,4 @@ artifacts/           # generated models + eval outputs (gitignored pkl ok to reg
 Take-home submission code; sample text is synthetic. Third-party libs retain their own licenses (see `CITATIONS.md`).
 
 ## PR note
-This feature branch is the review surface for the take-home MVP.
+`main` ships the take-home MVP plus the deployable web demo.

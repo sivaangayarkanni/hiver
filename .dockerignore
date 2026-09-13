@@ -1,0 +1,14 @@
+.git
+.venv
+venv
+.pytest_cache
+__pycache__
+*.pyc
+*.egg-info
+.coverage
+htmlcov
+.env
+.idea
+.vscode
+artifacts/*.pkl
+artifacts/threads.jsonl
