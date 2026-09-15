@@ -1,0 +1,12 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "installCommand": "pip install -e .",
+  "functions": {
+    "app/main.py": {
+      "maxDuration": 60,
+      "memory": 1024,
+      "includeFiles": "data/**,artifacts/**,src/**"
+    }
+  }
+}
