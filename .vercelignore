@@ -1,0 +1,14 @@
+.venv
+venv
+.env
+.env.*
+!.env.example
+.git
+.pytest_cache
+**/__pycache__
+*.egg-info
+tests
+artifacts/*.pkl
+artifacts/models
+.agents
+skills-lock.json

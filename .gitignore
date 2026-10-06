@@ -19,3 +19,8 @@ artifacts/models/
 artifacts/threads.jsonl
 !artifacts/eval_report.json
 !artifacts/pipeline_out.jsonl
+.vercel
+.env*
+!.env.example
+.agents/
+skills-lock.json
