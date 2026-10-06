@@ -1,173 +1,36 @@
-"""Deployable FastAPI demo: classify → draft → escalate.
+"""Hiver AppleSupport shared inbox — FastAPI backend + single-page frontend.
 
-Serves a single-page UI at GET / and JSON at POST /api/analyze.
-Default dry_run=True so Railway/Render work without an API key.
+Routes
+  GET  /                      single-page app (static/index.html)
+  GET  /health                liveness + agent + database status
+  POST /api/analyze           stateless classify → draft → escalate playground
+  /api/auth/*                 signup, login, logout, me
+  /api/tickets*               shared inbox CRUD + reply / notes / re-run agent
+  GET  /api/stats, /api/users, /api/meta
+
+Data lives in Postgres (``DATABASE_URL`` / ``POSTGRES_URL``); see ``db.py``.
 """
 
 from __future__ import annotations
 
-import os
-import threading
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional
+from urllib.parse import urlsplit
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
-from pydantic import BaseModel, Field
+import psycopg
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field, field_validator
 
-from hiver_agent.classify.predict import IntentClassifier
-from hiver_agent.data.io import load_jsonl
-from hiver_agent.data.threads import build_threads
-from hiver_agent.llm.client import get_llm_client
-from hiver_agent.pipeline.run import SupportAgentPipeline
-from hiver_agent.retrieve.draft import ReplyDrafter
-from hiver_agent.retrieve.index import RetrievalIndex
-from hiver_agent.schemas import GoldenExample, Message, Thread
+from hiver_agent.intents import INTENT_NAMES, INTENTS
+from hiver_agent.web import auth, db, tickets
+from hiver_agent.web.agent import ensure_runtime, runtime_error, runtime_ready
 
-
-def _find_root() -> Path:
-    env = os.getenv("HIVER_ROOT")
-    candidates: list[Path] = []
-    if env:
-        candidates.append(Path(env))
-    candidates.append(Path.cwd())
-    candidates.append(Path("/app"))
-    here = Path(__file__).resolve()
-    candidates.extend(here.parents)
-    for c in candidates:
-        if (c / "data" / "sample" / "messages.jsonl").exists():
-            return c
-        if (c / "data" / "golden" / "golden.jsonl").exists():
-            return c
-    return Path.cwd()
-
-
-def _threads_from_golden(path: Path) -> list[Thread]:
-    threads: list[Thread] = []
-    for raw in load_jsonl(path):
-        g = GoldenExample.model_validate(raw)
-        msgs = [
-            Message(
-                message_id=f"{g.example_id}-c",
-                thread_id=g.thread_id,
-                author="customer",
-                role="customer",
-                text=g.customer_text,
-                created_at="",
-            )
-        ]
-        if g.reference_reply:
-            msgs.append(
-                Message(
-                    message_id=f"{g.example_id}-a",
-                    thread_id=g.thread_id,
-                    author="AppleSupport",
-                    role="agent",
-                    text=g.reference_reply,
-                    created_at="",
-                )
-            )
-        threads.append(
-            Thread(
-                thread_id=g.thread_id,
-                messages=msgs,
-                customer_text=g.customer_text,
-                resolution_text=g.reference_reply or "",
-                intent=g.intent,
-            )
-        )
-    return threads
-
-
-def _load_threads(root: Path) -> list[Thread]:
-    sample = root / "data" / "sample" / "messages.jsonl"
-    golden = root / "data" / "golden" / "golden.jsonl"
-    if sample.exists():
-        return build_threads(load_jsonl(sample))
-    if golden.exists():
-        return _threads_from_golden(golden)
-    return []
-
-
-def _xy(threads: list[Thread]) -> tuple[list[str], list[str]]:
-    texts, labels = [], []
-    for t in threads:
-        if t.customer_text and t.intent:
-            texts.append(t.customer_text)
-            labels.append(t.intent)
-    return texts, labels
-
-
-def _load_or_train(root: Path, threads: list[Thread]) -> IntentClassifier:
-    model_path = root / "artifacts" / "tfidf_logreg.pkl"
-    if model_path.exists():
-        try:
-            return IntentClassifier.load(model_path, method="tfidf")
-        except Exception:
-            pass
-    texts, labels = _xy(threads)
-    if not texts:
-        clf = IntentClassifier("keyword")
-        clf.fit(["help"], ["other"])
-        return clf
-    clf = IntentClassifier("tfidf").fit(texts, labels)
-    try:
-        clf.save(model_path)
-    except OSError:
-        pass
-    return clf
-
-
-class AgentRuntime:
-    def __init__(self, classifier: IntentClassifier, index: RetrievalIndex) -> None:
-        self.classifier = classifier
-        self.index = index
-
-    def analyze(self, text: str, dry_run: bool = True) -> dict[str, Any]:
-        llm = get_llm_client(dry_run=dry_run)
-        pipe = SupportAgentPipeline(
-            self.classifier, ReplyDrafter(self.index, llm)
-        )
-        result = pipe.run("web", text)
-        return {
-            "intent": result.intent.intent,
-            "confidence": result.intent.confidence,
-            "method": result.intent.method,
-            "scores": result.intent.scores,
-            "draft": result.draft.text,
-            "draft_sources": result.draft.sources,
-            "draft_method": result.draft.method,
-            "escalation_action": result.escalation.action,
-            "escalation_reason": result.escalation.reason,
-            "rules_fired": result.escalation.rules_fired,
-            "dry_run": result.draft.dry_run,
-        }
-
-
-_lock = threading.Lock()
-_runtime: Optional[AgentRuntime] = None
-_ready_error: Optional[str] = None
-
-
-def ensure_runtime() -> AgentRuntime:
-    global _runtime, _ready_error
-    if _runtime is not None:
-        return _runtime
-    with _lock:
-        if _runtime is not None:
-            return _runtime
-        try:
-            root = _find_root()
-            threads = _load_threads(root)
-            clf = _load_or_train(root, threads)
-            index = RetrievalIndex().build(threads)
-            _runtime = AgentRuntime(clf, index)
-            _ready_error = None
-        except Exception as exc:  # pragma: no cover - surfaced via /health
-            _ready_error = str(exc)
-            raise
-        return _runtime
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 @asynccontextmanager
@@ -175,21 +38,67 @@ async def lifespan(_app: FastAPI):
     try:
         ensure_runtime()
     except Exception:
-        # First request will retry; /health reports not-ready.
-        pass
+        pass  # first request retries; /health reports not-ready
+    try:
+        if db.database_url():
+            db.ensure_schema()
+    except Exception:
+        pass  # surfaced by /health and API errors
     yield
+    db.reset_pool()
 
 
 app = FastAPI(
-    title="Hiver AppleSupport agent",
-    description="Classify → draft → escalate demo (dry-run by default).",
-    version="0.1.0",
+    title="Hiver AppleSupport inbox",
+    description="Shared support inbox with an AI triage agent (classify → draft → escalate).",
+    version="0.2.0",
     lifespan=lifespan,
 )
 
 
+# ------------------------------------------------------------------ errors
+
+@app.exception_handler(db.DatabaseNotConfigured)
+async def _db_not_configured(_req: Request, exc: db.DatabaseNotConfigured):
+    return JSONResponse(status_code=503, content={"detail": str(exc)})
+
+
+@app.exception_handler(psycopg.OperationalError)
+async def _db_unavailable(_req: Request, _exc: psycopg.OperationalError):
+    return JSONResponse(
+        status_code=503, content={"detail": "Database is unavailable right now. Please retry."}
+    )
+
+
+@app.exception_handler(LookupError)
+async def _not_found(_req: Request, exc: LookupError):
+    return JSONResponse(status_code=404, content={"detail": str(exc) or "not found"})
+
+
+# ------------------------------------------------------------------ guards
+
+def same_origin(request: Request) -> None:
+    """Basic CSRF defence for cookie-authenticated writes: reject cross-site
+    Origin headers and non-JSON bodies on state-changing requests."""
+    if request.method in ("GET", "HEAD", "OPTIONS"):
+        return
+    origin = request.headers.get("origin")
+    if origin:
+        host = request.headers.get("x-forwarded-host") or request.headers.get("host") or ""
+        if urlsplit(origin).netloc != host:
+            raise HTTPException(status_code=403, detail="Cross-origin request blocked.")
+    ctype = request.headers.get("content-type", "")
+    if not ctype.startswith("application/json"):
+        raise HTTPException(status_code=415, detail="Send requests as application/json.")
+
+
+api = APIRouter(prefix="/api", dependencies=[Depends(same_origin)])
+
+
+# ------------------------------------------------------------------ models
+
 class AnalyzeRequest(BaseModel):
-    text: str = Field(..., min_length=1)
+    text: str = Field(..., min_length=1, max_length=4000)
     dry_run: bool = True
 
 
@@ -205,263 +114,295 @@ class AnalyzeResponse(BaseModel):
     escalation_reason: str
     rules_fired: list[str] = Field(default_factory=list)
     dry_run: bool
+    llm_error: Optional[str] = None
 
+
+class SignupRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=80)
+    email: str = Field(..., max_length=254)
+    password: str = Field(..., min_length=8, max_length=200)
+
+    @field_validator("name")
+    @classmethod
+    def _name(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("Name is required")
+        return v
+
+    @field_validator("email")
+    @classmethod
+    def _email(cls, v: str) -> str:
+        v = v.strip().lower()
+        if not EMAIL_RE.match(v):
+            raise ValueError("Enter a valid email address")
+        return v
+
+
+class LoginRequest(BaseModel):
+    email: str = Field(..., max_length=254)
+    password: str = Field(..., min_length=1, max_length=200)
+
+
+class TicketCreate(BaseModel):
+    customer_handle: str = Field(..., min_length=1, max_length=80)
+    customer_text: str = Field(..., min_length=3, max_length=4000)
+    channel: Literal["twitter", "email", "chat"] = "twitter"
+    dry_run: bool = True
+
+    @field_validator("customer_handle", "customer_text")
+    @classmethod
+    def _strip(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("This field is required")
+        return v
+
+
+class TicketUpdate(BaseModel):
+    status: Optional[Literal["open", "escalated", "replied", "closed"]] = None
+    priority: Optional[Literal["low", "normal", "high", "urgent"]] = None
+    assignee_id: Optional[int] = None
+    draft: Optional[str] = Field(None, max_length=4000)
+
+
+class ReplyRequest(BaseModel):
+    text: str = Field(..., min_length=1, max_length=4000)
+    close: bool = False
+
+    @field_validator("text")
+    @classmethod
+    def _strip(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("Reply cannot be empty")
+        return v
+
+
+class NoteRequest(BaseModel):
+    body: str = Field(..., min_length=1, max_length=2000)
+
+    @field_validator("body")
+    @classmethod
+    def _strip(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("Note cannot be empty")
+        return v
+
+
+class RerunRequest(BaseModel):
+    dry_run: bool = True
+
+
+# ------------------------------------------------------------------ helpers
+
+def _runtime():
+    try:
+        return ensure_runtime()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Agent not ready: {exc}") from exc
+
+
+def _ticket_or_404(ticket_id: int) -> dict[str, Any]:
+    t = tickets.get_ticket(ticket_id)
+    if t is None:
+        raise HTTPException(status_code=404, detail=f"Ticket #{ticket_id} not found")
+    return t
+
+
+# ------------------------------------------------------------------ public
 
 @app.get("/health")
 def health() -> dict[str, Any]:
-    ready = _runtime is not None
-    if not ready:
+    agent_ok = runtime_ready()
+    if not agent_ok:
         try:
             ensure_runtime()
-            ready = True
+            agent_ok = True
         except Exception:
-            ready = False
-    payload: dict[str, Any] = {"ok": ready, "status": "ok" if ready else "not_ready"}
-    if _ready_error and not ready:
-        payload["error"] = _ready_error
+            agent_ok = False
+    db_status = "not_configured"
+    if db.database_url():
+        try:
+            db.ensure_schema()
+            db_status = "ok" if db.ping() else "error"
+        except Exception as exc:  # pragma: no cover - depends on network
+            db_status = f"error: {type(exc).__name__}"
+    ok = agent_ok and db_status == "ok"
+    payload: dict[str, Any] = {
+        "ok": ok,
+        "status": "ok" if ok else "degraded",
+        "agent": "ok" if agent_ok else "not_ready",
+        "database": db_status,
+    }
+    if not agent_ok and runtime_error():
+        payload["agent_error"] = runtime_error()
     return payload
 
 
-@app.post("/api/analyze", response_model=AnalyzeResponse)
+@api.post("/analyze", response_model=AnalyzeResponse)
 def analyze(req: AnalyzeRequest) -> AnalyzeResponse:
     text = req.text.strip()
     if not text:
         raise HTTPException(status_code=400, detail="text is required")
+    return AnalyzeResponse(**_runtime().analyze(text, dry_run=req.dry_run))
+
+
+@api.get("/meta")
+def meta() -> dict[str, Any]:
+    from hiver_agent.llm.client import LLMClient
+
+    return {
+        "intents": [{"name": n, "description": INTENTS[n].description} for n in INTENT_NAMES],
+        "statuses": list(tickets.STATUSES),
+        "priorities": list(tickets.PRIORITIES),
+        "live_llm_available": not LLMClient().dry_run,
+    }
+
+
+# ------------------------------------------------------------------ auth
+
+@api.post("/auth/signup", status_code=201)
+def signup(req: SignupRequest, request: Request, response: Response) -> dict[str, Any]:
+    db.ensure_schema()
+    with db.connection() as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM users WHERE lower(email) = %s", (req.email,)
+        ).fetchone()
+        if exists:
+            raise HTTPException(status_code=409, detail="An account with this email already exists.")
+        user = conn.execute(
+            "INSERT INTO users (email, name, password_hash) VALUES (%s, %s, %s) RETURNING id, email, name",
+            (req.email, req.name, auth.hash_password(req.password)),
+        ).fetchone()
+    auth.create_session(response, request, user["id"])
+    return {"user": auth.public_user(user)}
+
+
+@api.post("/auth/login")
+def login(req: LoginRequest, request: Request, response: Response) -> dict[str, Any]:
+    db.ensure_schema()
+    with db.connection() as conn:
+        user = conn.execute(
+            "SELECT id, email, name, password_hash FROM users WHERE lower(email) = %s",
+            (req.email.strip().lower(),),
+        ).fetchone()
+    if user is None or not auth.verify_password(req.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Incorrect email or password.")
+    auth.create_session(response, request, user["id"])
+    return {"user": auth.public_user(user)}
+
+
+@api.post("/auth/logout")
+def logout(request: Request, response: Response) -> dict[str, Any]:
+    auth.destroy_session(request, response)
+    return {"ok": True}
+
+
+@api.get("/auth/me")
+def me(request: Request) -> dict[str, Any]:
+    """Current user, or ``{"user": null}`` when signed out (no 401 noise)."""
+    db.ensure_schema()
+    user = auth.optional_user(request)
+    return {"user": auth.public_user(user) if user else None}
+
+
+# ------------------------------------------------------------------ inbox
+
+@api.get("/users")
+def users(_user: dict = Depends(auth.current_user)) -> dict[str, Any]:
+    return {"items": tickets.list_users()}
+
+
+@api.get("/stats")
+def stats(user: dict = Depends(auth.current_user)) -> dict[str, Any]:
+    return tickets.stats(user["id"])
+
+
+@api.get("/tickets")
+def list_tickets(
+    user: dict = Depends(auth.current_user),
+    status: Optional[Literal["open", "escalated", "replied", "closed", "active"]] = None,
+    intent: Optional[str] = Query(None, max_length=40),
+    assignee: Optional[Literal["me", "unassigned"]] = None,
+    q: Optional[str] = Query(None, max_length=200),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    if intent and intent not in INTENTS:
+        raise HTTPException(status_code=422, detail=f"Unknown intent '{intent}'")
+    return tickets.list_tickets(
+        user_id=user["id"], status=status, intent=intent, assignee=assignee,
+        q=(q or "").strip() or None, limit=limit, offset=offset,
+    )
+
+
+@api.post("/tickets", status_code=201)
+def create_ticket(req: TicketCreate, user: dict = Depends(auth.current_user)) -> dict[str, Any]:
+    analysis = _runtime().analyze(req.customer_text, dry_run=req.dry_run)
+    handle = req.customer_handle
+    if req.channel == "twitter" and not handle.startswith("@"):
+        handle = "@" + handle
+    tid = tickets.create_ticket(
+        customer_handle=handle, customer_text=req.customer_text, channel=req.channel,
+        analysis=analysis, user_id=user["id"],
+    )
+    return {"ticket": _ticket_or_404(tid), "llm_error": analysis.get("llm_error")}
+
+
+@api.get("/tickets/{ticket_id}")
+def get_ticket(ticket_id: int, _user: dict = Depends(auth.current_user)) -> dict[str, Any]:
+    return {"ticket": _ticket_or_404(ticket_id)}
+
+
+@api.patch("/tickets/{ticket_id}")
+def update_ticket(
+    ticket_id: int, req: TicketUpdate, user: dict = Depends(auth.current_user)
+) -> dict[str, Any]:
+    changes = req.model_dump(exclude_unset=True)
+    if not changes:
+        raise HTTPException(status_code=400, detail="Nothing to update.")
+    for key in ("status", "priority"):
+        if key in changes and changes[key] is None:
+            raise HTTPException(status_code=422, detail=f"{key} cannot be null")
     try:
-        runtime = ensure_runtime()
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"agent not ready: {exc}") from exc
-    return AnalyzeResponse(**runtime.analyze(text, dry_run=req.dry_run))
+        tickets.update_ticket(ticket_id, user["id"], changes)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"ticket": _ticket_or_404(ticket_id)}
 
 
-@app.get("/", response_class=HTMLResponse)
-def index() -> str:
-    return INDEX_HTML
+@api.post("/tickets/{ticket_id}/reply")
+def reply(ticket_id: int, req: ReplyRequest, user: dict = Depends(auth.current_user)) -> dict[str, Any]:
+    tickets.reply(ticket_id, user["id"], req.text, close=req.close)
+    return {"ticket": _ticket_or_404(ticket_id)}
 
 
-INDEX_HTML = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Hiver · AppleSupport agent</title>
-  <style>
-    :root {
-      --bg: #0f1412;
-      --bg-elev: #17201c;
-      --ink: #e8efe9;
-      --muted: #8fa196;
-      --line: rgba(232, 239, 233, 0.1);
-      --accent: #8fbf6a;
-      --accent-ink: #10210c;
-      --warn: #e0a36a;
-      --warn-bg: rgba(224, 163, 106, 0.12);
-      --ok: #7dcea0;
-      --ok-bg: rgba(125, 206, 160, 0.12);
-      --shadow: 0 24px 60px rgba(0, 0, 0, 0.35);
-    }
-    * { box-sizing: border-box; }
-    html, body { margin: 0; padding: 0; }
-    body {
-      min-height: 100vh;
-      font-family: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
-      background:
-        radial-gradient(1200px 600px at 10% -10%, rgba(143, 191, 106, 0.08), transparent 50%),
-        radial-gradient(900px 500px at 110% 10%, rgba(224, 163, 106, 0.06), transparent 45%),
-        var(--bg);
-      color: var(--ink);
-    }
-    .wrap { max-width: 760px; margin: 0 auto; padding: 48px 20px 72px; }
-    header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 28px; }
-    .brand { display: flex; gap: 14px; align-items: center; }
-    .mark {
-      width: 40px; height: 40px; border-radius: 12px;
-      background: linear-gradient(160deg, #b7d48e, #5e8f4a);
-      display: grid; place-items: center;
-      box-shadow: 0 8px 20px rgba(143, 191, 106, 0.25);
-    }
-    .mark svg { width: 22px; height: 22px; }
-    h1 { font-size: 1.55rem; font-weight: 600; letter-spacing: -0.02em; margin: 0; }
-    .sub { font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; color: var(--muted); font-size: 0.88rem; margin-top: 4px; }
-    .badge {
-      font-family: ui-sans-serif, system-ui, sans-serif;
-      font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase;
-      border: 1px solid var(--line); border-radius: 999px;
-      padding: 6px 10px; color: var(--accent); background: rgba(143, 191, 106, 0.08);
-      white-space: nowrap;
-    }
-    .badge.live { color: var(--warn); background: var(--warn-bg); }
-    .card {
-      background: var(--bg-elev);
-      border: 1px solid var(--line);
-      border-radius: 20px;
-      padding: 22px;
-      box-shadow: var(--shadow);
-    }
-    label { font-family: ui-sans-serif, system-ui, sans-serif; font-size: 0.78rem; color: var(--muted); letter-spacing: 0.04em; text-transform: uppercase; }
-    textarea {
-      width: 100%; margin-top: 10px; resize: vertical; min-height: 130px;
-      background: #101714; color: var(--ink);
-      border: 1px solid var(--line); border-radius: 14px;
-      padding: 14px 14px; font-size: 1.05rem; line-height: 1.45;
-      font-family: inherit; outline: none;
-    }
-    textarea:focus { border-color: rgba(143, 191, 106, 0.55); box-shadow: 0 0 0 3px rgba(143, 191, 106, 0.15); }
-    .chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0 16px; }
-    .chip {
-      font-family: ui-sans-serif, system-ui, sans-serif;
-      font-size: 0.78rem; color: var(--ink);
-      background: transparent; border: 1px solid var(--line);
-      border-radius: 999px; padding: 6px 11px; cursor: pointer;
-    }
-    .chip:hover { border-color: var(--accent); color: var(--accent); }
-    .row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-    button.run {
-      font-family: ui-sans-serif, system-ui, sans-serif;
-      font-weight: 600; font-size: 0.95rem;
-      background: var(--accent); color: var(--accent-ink);
-      border: 0; border-radius: 999px; padding: 11px 20px; cursor: pointer;
-    }
-    button.run:disabled { opacity: 0.55; cursor: wait; }
-    button.run:hover:not(:disabled) { filter: brightness(1.06); }
-    .hint { font-family: ui-sans-serif, system-ui, sans-serif; font-size: 0.78rem; color: var(--muted); }
-    #status { min-height: 1.2em; margin-top: 12px; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 0.85rem; color: var(--muted); }
-    #status.err { color: #e08b7a; }
-    #results { display: none; margin-top: 22px; }
-    .grid { display: grid; grid-template-columns: 1fr; gap: 12px; }
-    @media (min-width: 640px) { .split { grid-template-columns: 1fr 1fr; } }
-    .panel { background: #121a16; border: 1px solid var(--line); border-radius: 16px; padding: 16px 16px 14px; }
-    .k { font-family: ui-sans-serif, system-ui, sans-serif; font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin-bottom: 8px; }
-    .intent {
-      font-size: 1.2rem; margin: 0 0 8px;
-      font-variant: lining-nums;
-    }
-    .conf-bar { height: 6px; background: #243028; border-radius: 99px; overflow: hidden; }
-    .conf-bar > span { display: block; height: 100%; background: var(--accent); width: 0; transition: width 0.35s ease; }
-    .conf-num { font-family: ui-sans-serif, system-ui, sans-serif; font-size: 0.8rem; color: var(--muted); margin-top: 6px; }
-    .action {
-      display: inline-block; font-family: ui-sans-serif, system-ui, sans-serif;
-      font-size: 0.78rem; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase;
-      border-radius: 999px; padding: 5px 10px; margin-bottom: 8px;
-    }
-    .action.escalate { background: var(--warn-bg); color: var(--warn); }
-    .action.auto_handle { background: var(--ok-bg); color: var(--ok); }
-    .reason, .draft { margin: 0; line-height: 1.5; font-size: 1.02rem; }
-    .draft { white-space: pre-wrap; }
-    footer { margin-top: 28px; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 0.75rem; color: var(--muted); }
-    footer code { color: var(--ink); }
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <header>
-      <div class="brand">
-        <div class="mark" aria-hidden="true">
-          <svg viewBox="0 0 24 24" fill="none">
-            <path d="M12 3c1.2 2.4.6 4.4-.6 5.6C9.8 6.8 8 6.2 6.6 6.8 8.2 4.4 10.2 3.2 12 3z" fill="#10210c"/>
-            <path d="M7 10.2c2.2-1.4 4.2-.8 5-0.2.8-.6 2.8-1.2 5 .2 1.6 1 2.6 2.8 2.6 4.8 0 3.6-3.1 6.2-7.6 6.2S4.4 18.6 4.4 15c0-2 .9-3.8 2.6-4.8z" fill="#10210c"/>
-          </svg>
-        </div>
-        <div>
-          <h1>AppleSupport agent</h1>
-          <div class="sub">Hiver take-home · classify → draft → escalate</div>
-        </div>
-      </div>
-      <div id="modeBadge" class="badge">Dry-run</div>
-    </header>
+@api.post("/tickets/{ticket_id}/notes", status_code=201)
+def add_note(ticket_id: int, req: NoteRequest, user: dict = Depends(auth.current_user)) -> dict[str, Any]:
+    tickets.add_note(ticket_id, user["id"], req.body)
+    return {"ticket": _ticket_or_404(ticket_id)}
 
-    <div class="card">
-      <label for="msg">Customer message</label>
-      <textarea id="msg" placeholder="e.g. Battery draining after the iOS update…">Battery draining after iOS update — any tips?</textarea>
-      <div class="chips">
-        <button type="button" class="chip" data-text="I cannot sign in to my Apple ID — keeps saying locked for security reasons.">Apple ID locked</button>
-        <button type="button" class="chip" data-text="iCloud storage full, can't backup photos.">iCloud full</button>
-        <button type="button" class="chip" data-text="My iPhone was stolen last night. I need to lock it and wipe it.">Stolen iPhone</button>
-        <button type="button" class="chip" data-text="There's an unauthorized charge on my App Store receipt. I want a refund.">Unauthorized charge</button>
-      </div>
-      <div class="row">
-        <div class="hint">Uses the TF-IDF model + mock LLM unless you send <code>dry_run: false</code>.</div>
-        <button class="run" id="runBtn" type="button">Run agent</button>
-      </div>
-      <div id="status"></div>
-    </div>
 
-    <div id="results">
-      <div class="grid split" style="margin-top:0">
-        <div class="panel">
-          <div class="k">Intent + confidence</div>
-          <p class="intent" id="intent"></p>
-          <div class="conf-bar"><span id="confBar"></span></div>
-          <div class="conf-num" id="confNum"></div>
-        </div>
-        <div class="panel">
-          <div class="k">Escalation</div>
-          <div id="action" class="action">—</div>
-          <p class="reason" id="reason"></p>
-        </div>
-      </div>
-      <div class="panel" style="margin-top:12px">
-        <div class="k">Drafted reply</div>
-        <p class="draft" id="draft"></p>
-      </div>
-    </div>
+@api.post("/tickets/{ticket_id}/reanalyze")
+def reanalyze(
+    ticket_id: int, req: RerunRequest, user: dict = Depends(auth.current_user)
+) -> dict[str, Any]:
+    t = _ticket_or_404(ticket_id)
+    analysis = _runtime().analyze(t["customer_text"], dry_run=req.dry_run)
+    tickets.apply_analysis(ticket_id, user["id"], analysis)
+    return {"ticket": _ticket_or_404(ticket_id), "llm_error": analysis.get("llm_error")}
 
-    <footer>
-      Local / deploy start:
-      <code>uvicorn hiver_agent.web.app:app --host 0.0.0.0 --port ${PORT:-8000}</code>
-    </footer>
-  </div>
-  <script>
-    const $ = (id) => document.getElementById(id);
-    const msg = $("msg");
-    const runBtn = $("runBtn");
-    const status = $("status");
-    const results = $("results");
-    const badge = $("modeBadge");
 
-    document.querySelectorAll(".chip").forEach((el) => {
-      el.addEventListener("click", () => { msg.value = el.dataset.text; msg.focus(); });
-    });
+app.include_router(api)
 
-    async function run() {
-      const text = msg.value.trim();
-      if (!text) { status.className = "err"; status.textContent = "Enter a customer message."; return; }
-      runBtn.disabled = true;
-      status.className = "";
-      status.textContent = "Running classify → draft → escalate…";
-      try {
-        const res = await fetch("/api/analyze", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text, dry_run: true }),
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || res.statusText);
-        results.style.display = "block";
-        $("intent").textContent = data.intent.replaceAll("_", " ");
-        const pct = Math.round((data.confidence || 0) * 100);
-        $("confBar").style.width = pct + "%";
-        $("confNum").textContent = (data.confidence || 0).toFixed(2) + " · " + (data.method || "");
-        const act = data.escalation_action || "";
-        $("action").textContent = act.replaceAll("_", " ");
-        $("action").className = "action " + act;
-        $("reason").textContent = data.escalation_reason || "";
-        $("draft").textContent = data.draft || "";
-        badge.textContent = data.dry_run ? "Dry-run" : "Live LLM";
-        badge.className = data.dry_run ? "badge" : "badge live";
-        status.textContent = "Done.";
-      } catch (err) {
-        status.className = "err";
-        status.textContent = err.message || String(err);
-      } finally {
-        runBtn.disabled = false;
-      }
-    }
-    runBtn.addEventListener("click", run);
-    msg.addEventListener("keydown", (e) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === "Enter") run();
-    });
-  </script>
-</body>
-</html>
-"""
+
+# ------------------------------------------------------------------ frontend
+
+@app.get("/", include_in_schema=False)
+def index() -> FileResponse:
+    return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-cache"})
+
+
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

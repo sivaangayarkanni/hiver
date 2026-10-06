@@ -60,46 +60,85 @@ python -m hiver_agent evaluate --live --judge-sample 10
 `--dry-run` / missing `OPENAI_API_KEY` uses fixture replies + mock judge — fully reproducible offline.
 
 
-## Web demo (no API key)
+## Full-stack web app: shared AppleSupport inbox
+
+The web app turns the agent into a working, Hiver-style **shared support inbox**
+backed by Postgres:
+
+- **Sign up / sign in** (email + password, scrypt hashes, DB-backed HttpOnly session cookies)
+- **Inbox views**: active, assigned to me, unassigned, escalated, open (auto-handle), replied, closed, all — with search (`text`, `@handle`, `#id`), intent filter, pagination and live counts
+- **New ticket** → the agent runs classify → draft → escalate and the result is stored (escalations land as `escalated` with `high`/`urgent` priority)
+- **Ticket detail**: change status / priority / assignee, edit + save the grounded draft, **send reply** (or send & close), re-run the agent, internal notes, full activity timeline
+- **Dashboard stats**: active, escalated, assigned to me, agent auto-handle rate
+- **Agent playground** (`#/playground`, no login): the original stateless demo
+
+**Demo login** (seeded automatically into an empty database): `demo@hiver.dev` / `hiver-demo-2026`
+(also `maya@hiver.dev`, same password; override with `HIVER_DEMO_PASSWORD`).
+
+### Stack
+
+| Layer | What |
+| --- | --- |
+| Frontend | Dependency-free SPA (`src/hiver_agent/web/static/`: `index.html`, `app.js`, `styles.css`), hash routing |
+| Backend | FastAPI (`src/hiver_agent/web/app.py`) — auth, tickets, stats, analyze |
+| Database | Postgres via `psycopg` 3 + `psycopg_pool`; SQL migrations in `src/hiver_agent/web/migrations/` |
+| Agent | Existing TF-IDF classifier + retrieval drafter + escalation rules (`agent.py` wraps them) |
+| Hosting | Vercel Python runtime (`app/main.py` entrypoint), Postgres on Supabase (free plan, via the Vercel Marketplace) |
+
+### Run locally
 
 ```bash
-pip install -e .
-uvicorn hiver_agent.web.app:app --host 0.0.0.0 --port ${PORT:-8000}
-# open http://localhost:8000
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
+cp .env.example .env          # set DATABASE_URL to any Postgres
+python -m hiver_agent db migrate
+python -m hiver_agent db seed  # demo users + ~22 triaged tickets (skipped if users exist)
+uvicorn app.main:app --reload --port 8000
+# open http://localhost:8000  → sign in with the demo login
 ```
 
-`GET /` is a single-page UI. `POST /api/analyze` accepts `{ "text": "...", "dry_run": true }` and runs classify → draft → escalate. `GET /health` returns ok.
+Migrations and the demo seed also run automatically on the first request
+(`HIVER_AUTO_MIGRATE=1`, `HIVER_AUTO_SEED=1` by default), so a fresh database just works.
 
-On startup (or first request) the app loads `artifacts/tfidf_logreg.pkl` if present, otherwise trains TF-IDF quickly from `data/sample` or `data/golden`. Default `dry_run=true` so no OpenAI key is required.
+### API (JSON; cookie auth; writes must be `application/json` and same-origin)
 
-## Deploy (Railway / Render)
+| Method | Path | |
+| --- | --- | --- |
+| GET | `/health` | agent + database status |
+| POST | `/api/analyze` | stateless classify → draft → escalate (public) |
+| POST | `/api/auth/signup` · `/api/auth/login` · `/api/auth/logout` | auth |
+| GET | `/api/auth/me` | current user or `{"user": null}` |
+| GET | `/api/meta` · `/api/users` · `/api/stats` | intents/statuses, teammates, dashboard counts |
+| GET / POST | `/api/tickets` | list (`status`, `intent`, `assignee=me\|unassigned`, `q`, `limit`, `offset`) / create + triage |
+| GET / PATCH | `/api/tickets/{id}` | detail with events / update `status`, `priority`, `assignee_id`, `draft` |
+| POST | `/api/tickets/{id}/reply` · `/notes` · `/reanalyze` | send reply (`close` optional), internal note, re-run agent |
 
-`main` is deploy-ready.
-
-**Start command**
+### Tests
 
 ```bash
-uvicorn hiver_agent.web.app:app --host 0.0.0.0 --port ${PORT:-8000}
+pytest -q                                                   # unit tests
+TEST_DATABASE_URL=postgresql://postgres@localhost:5432/hiver_test pytest -q   # + API integration (drops app tables in that DB!)
 ```
 
-**Railway**
+### Deploy (Vercel)
 
-1. New project → Deploy from GitHub repo `sivaangayarkanni/hiver` on branch `main`
-2. Uses `Dockerfile` + `railway.toml` (health check: `GET /health`)
-3. Optional env: `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL` (omit all three for the mock LLM)
+1. `vercel link` (Framework preset: FastAPI; leave Install Command on auto so it uses `requirements.txt`).
+2. Add a Postgres: `vercel integration add supabase --plan free` (or Neon) — this sets `POSTGRES_URL`
+   for all environments. Any `DATABASE_URL` works too (`vercel env add DATABASE_URL`).
+3. `vercel --prod`. The first request migrates and seeds the database; or run
+   `python -m hiver_agent db seed` locally against the same URL.
 
-**Render**
+Optional env: `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL` for live LLM drafts (falls back to the
+dry-run drafter if the provider errors), `HIVER_DEMO_PASSWORD`, `SESSION_DAYS`.
 
-1. New Web Service → this repo
-2. Docker: uses `Dockerfile`
-3. Native Python: build `pip install .` and the start command above (`Procfile` is included)
-
-No API key is required for the public dry-run demo.
+Docker / Railway / Render still work (`Dockerfile`, `Procfile`, `railway.toml`) — just set `DATABASE_URL`.
 
 ## Layout
 
 ```
 src/hiver_agent/     # package (classify, retrieve, escalate, eval, pipeline, cli, web)
+src/hiver_agent/web/ # FastAPI app, auth, tickets repo, db + migrations, seed, static SPA
+app/main.py          # Vercel / uvicorn entrypoint
 data/sample/         # ~250 AppleSupport-style messages / ~110 threads (JSONL)
 data/golden/         # 200 labelled golden examples
 data/fixtures/       # tiny fixtures for tests
@@ -131,4 +170,4 @@ artifacts/           # generated models + eval outputs (gitignored pkl ok to reg
 Take-home submission code; sample text is synthetic. Third-party libs retain their own licenses (see `CITATIONS.md`).
 
 ## PR note
-`main` ships the take-home MVP plus the deployable web demo.
+`main` ships the take-home MVP plus the full-stack inbox (FastAPI + Postgres + SPA) deployable on Vercel.

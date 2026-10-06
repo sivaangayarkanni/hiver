@@ -277,3 +277,39 @@ def run_pipeline(
 
 if __name__ == "__main__":
     app()
+
+
+# ---------------------------------------------------------------- database
+
+db_app = typer.Typer(no_args_is_help=True, help="Postgres schema + demo data for the web inbox")
+app.add_typer(db_app, name="db")
+
+
+def _load_env() -> None:
+    from dotenv import load_dotenv
+
+    for name in (".env", ".env.local"):
+        load_dotenv(ROOT / name, override=False)
+
+
+@db_app.command("migrate")
+def db_migrate() -> None:
+    """Apply pending SQL migrations (uses DATABASE_URL or POSTGRES_URL)."""
+    _load_env()
+    from hiver_agent.web import db
+
+    applied = db.migrate()
+    console.print(f"Applied: {', '.join(applied) if applied else 'nothing (up to date)'}")
+    db.reset_pool()
+
+
+@db_app.command("seed")
+def db_seed(force: bool = typer.Option(False, "--force", help="Seed even if users exist")) -> None:
+    """Create demo users + sample tickets (skipped when users already exist)."""
+    _load_env()
+    from hiver_agent.web import db
+    from hiver_agent.web.seed import seed
+
+    db.migrate()
+    console.print(seed(force=force))
+    db.reset_pool()
