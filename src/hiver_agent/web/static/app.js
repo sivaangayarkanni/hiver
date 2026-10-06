@@ -310,13 +310,13 @@
     const reqId = (loadList.seq = (loadList.seq || 0) + 1);
     try {
       const data = await api("GET", "/api/tickets?" + params.toString());
-      if (reqId !== loadList.seq) return;
+      if (reqId !== loadList.seq || !listEl.isConnected) return;
       state.list = data;
       renderList();
     } catch (e) {
-      if (reqId !== loadList.seq) return;
-      listEl.innerHTML = `<div class="empty"><div class="big">Couldn't load tickets</div>${esc(e.message)}<div style="margin-top:12px"><button class="btn sm" id="retryList">Retry</button></div></div>`;
-      $("#retryList").onclick = loadList;
+      if (reqId !== loadList.seq || !listEl.isConnected) return;
+      listEl.innerHTML = `<div class="empty"><div class="big">Couldn't load tickets</div>${esc(e.message)}<div style="margin-top:12px"><button class="btn sm" data-retry>Retry</button></div></div>`;
+      listEl.querySelector("[data-retry]").onclick = loadList;
     }
   }
 
@@ -364,16 +364,18 @@
     }
     try {
       const data = await api("GET", `/api/tickets/${id}`);
-      if (state.selectedId !== id) return;
+      if (state.selectedId !== id || !el.isConnected) return;
       state.ticket = data.ticket;
       renderDetail();
     } catch (e) {
+      if (!el.isConnected) return;
       el.innerHTML = `<a class="back-link" href="#/inbox/${state.view}">← Back to list</a><div class="empty"><div class="big">${e.status === 404 ? "Ticket not found" : "Couldn't load ticket"}</div>${esc(e.message)}</div>`;
     }
   }
 
   function applyTicket(t) {
     state.ticket = t;
+    if (!$("#detail") || state.selectedId !== t.id) return;
     renderDetail();
     // update the row in place, then refresh list/stats in background
     loadList();
